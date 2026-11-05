@@ -1,0 +1,205 @@
+Voici tout ce qu’il vous faut, prêt à l’emploi.
+Je mets des valeurs d’exemple clairement marquées que vous remplacerez facilement.
+1. Fichiers answer.toml (un par serveur)
+Créez 4 fichiers :
+answer-pve1.toml
+[global]
+keyboard = "fr"
+country = "fr"
+timezone = "Europe/Paris"
+root-password = "ChangeMeStrongPassword123!"
+mailto = "admin@lab.local"
+fqdn = "pve1.lab.local"
+reboot-after-install = true
+
+[network]
+source = "from-answer"
+cidr = "192.168.10.11/24"
+gateway = "192.168.10.1"
+dns = "192.168.10.1"
+
+[disk-setup]
+filesystem = "ext4"
+disk-list = ["sda"]          # ← adapter si besoin (nvme0n1, sdb, etc.)
+answer-pve2.toml → changez seulement :
+fqdn = "pve2.lab.local"
+cidr = "192.168.10.12/24"
+answer-pve3.toml
+fqdn = "pve3.lab.local"
+cidr = "192.168.10.13/24"
+answer-pve4.toml
+fqdn = "pve4.lab.local"
+cidr = "192.168.10.14/24"
+2. Génération des 4 ISO automatisées
+# Une seule fois
+apt update && apt install -y proxmox-auto-install-assistant
+
+ISO_ORIG="/chemin/vers/proxmox-ve_8.x-x.iso"
+
+for i in 1 2 3 4; do
+  proxmox-auto-install-assistant prepare-iso \
+    --fetch-from iso \
+    --iso "$ISO_ORIG" \
+    --answer-file "answer-pve${i}.toml" \
+    --output "proxmox-pve${i}-auto.iso"
+done
+Vous obtenez : proxmox-pve1-auto.iso … proxmox-pve4-auto.iso
+3. Script Redfish / racadm pour lancer l’installation en parallèle
+#!/bin/bash
+# install-proxmox-idrac.sh
+
+# ========== À MODIFIER ==========
+IDRAC_USER="root"
+IDRAC_PASS="VotreMotDePasseiDRAC"
+
+declare -A SERVERS=(
+  ["pve1"]="192.168.20.11"   # IP de l'iDRAC
+  ["pve2"]="192.168.20.12"
+  ["pve3"]="192.168.20.13"
+  ["pve4"]="192.168.20.14"
+)
+
+# Chemin ou URL de vos ISO (HTTP recommandé)
+ISO_BASE="http://192.168.10.5/iso"   # serveur web local qui héberge les ISO
+# ================================
+
+for name in pve1 pve2 pve3 pve4; do
+  idrac_ip="${SERVERS[$name]}"
+  iso_url="\( {ISO_BASE}/proxmox- \){name}-auto.iso"
+
+  echo "========================================"
+  echo ">>> Préparation de $name ($idrac_ip)"
+  echo "========================================"
+
+  # 1. Monter l'ISO
+  racadm -r "$idrac_ip" -u "$IDRAC_USER" -p "$IDRAC_PASS" \
+    remoteimage -c -l "$iso_url"
+
+  # 2. Forcer le boot sur Virtual CD au prochain démarrage
+  racadm -r "$idrac_ip" -u "$IDRAC_USER" -p "$IDRAC_PASS" \
+    set iDRAC.ServerBoot.FirstBootDevice VCD-DVD
+
+  # 3. Redémarrer le serveur
+  racadm -r "$idrac_ip" -u "$IDRAC_USER" -p "$IDRAC_PASS" \
+    serveraction powercycle
+
+  echo "→ $name lancé"
+  echo
+done
+
+echo "Toutes les installations sont en cours..."
+echo "Surveillez les consoles iDRAC si besoin."
+Rendez-le exécutable :
+chmod +x install-proxmox-idrac.sh
+./install-proxmox-idrac.sh
+4. Playbook Ansible complet (post-install + cluster)
+Structure recommandée :
+proxmox-cluster/
+├── inventory.yml
+├── playbook.yml
+└── roles/          (optionnel)
+inventory.yml
+all:
+  children:
+    proxmox:
+      hosts:
+        pve1:
+          ansible_host: 192.168.10.11
+          node_ip: 192.168.10.11
+        pve2:
+          ansible_host: 192.168.10.12
+          node_ip: 192.168.10.12
+        pve3:
+          ansible_host: 192.168.10.13
+          node_ip: 192.168.10.13
+        pve4:
+          ansible_host: 192.168.10.14
+          node_ip: 192.168.10.14
+      vars:
+        ansible_user: root
+        ansible_password: "ChangeMeStrongPassword123!"   # ou utilisez ssh-key
+        ansible_ssh_common_args: '-o StrictHostKeyChecking=no'
+playbook.yml
+---
+- name: Configuration post-install Proxmox + Cluster
+  hosts: proxmox
+  gather_facts: yes
+  become: yes
+
+  vars:
+    cluster_name: "mon-cluster"
+    first_node: "pve1"
+    first_node_ip: "192.168.10.11"
+    domain: "lab.local"
+
+  tasks:
+    - name: Désactiver le dépôt Enterprise
+      ansible.builtin.replace:
+        path: /etc/apt/sources.list.d/pve-enterprise.list
+        regexp: '^deb'
+        replace: '#deb'
+
+    - name: Ajouter le dépôt no-subscription
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/pve-no-subscription.list
+        content: |
+          deb http://download.proxmox.com/debian/pve bookworm pve-no-subscription
+        mode: '0644'
+
+    - name: Mise à jour du système
+      ansible.builtin.apt:
+        update_cache: yes
+        upgrade: full
+        autoremove: yes
+
+    - name: Configurer /etc/hosts
+      ansible.builtin.blockinfile:
+        path: /etc/hosts
+        block: |
+          192.168.10.11 pve1.{{ domain }} pve1
+          192.168.10.12 pve2.{{ domain }} pve2
+          192.168.10.13 pve3.{{ domain }} pve3
+          192.168.10.14 pve4.{{ domain }} pve4
+
+    - name: Créer le cluster (uniquement sur le premier nœud)
+      ansible.builtin.command: pvecm create {{ cluster_name }}
+      when: inventory_hostname == first_node
+      register: cluster_create
+      failed_when: false   # ignore si déjà créé
+
+    - name: Attendre que le cluster soit prêt
+      ansible.builtin.pause:
+        seconds: 15
+      when: inventory_hostname == first_node
+
+    - name: Rejoindre le cluster (nœuds 2, 3 et 4)
+      ansible.builtin.command: pvecm add {{ first_node_ip }}
+      when: inventory_hostname != first_node
+      register: join
+      failed_when: false
+
+    - name: Afficher le statut du cluster
+      ansible.builtin.command: pvecm status
+      register: status
+      changed_when: false
+      run_once: true
+      delegate_to: "{{ first_node }}"
+
+    - name: Résultat
+      ansible.builtin.debug:
+        var: status.stdout_lines
+      run_once: true
+Lancement :
+ansible-playbook -i inventory.yml playbook.yml
+Résumé de l’ordre d’exécution
+Remplir les 4 answer-*.toml avec vos vraies IP / mots de passe / disques
+Générer les 4 ISO
+Mettre les ISO sur un serveur HTTP accessible depuis les iDRAC
+Lancer le script install-proxmox-idrac.sh
+Attendre la fin des installations (≈ 10-15 min)
+Lancer le playbook Ansible
+Voulez-vous que je vous prépare aussi :
+La version 100 % Redfish (sans racadm) en Python ou curl ?
+Un script qui attend la fin de l’installation et lance automatiquement le playbook ?
+La configuration des interfaces supplémentaires (si vous avez plusieurs cartes réseau) ?
+Dites-moi simplement vos IP réelles (iDRAC + management Proxmox) et je vous renvoie les fichiers déjà remplis.
